@@ -16,7 +16,7 @@ Every frame, Shinra-Meisin looks at an infrared image of one eye and predicts:
 - **The shape of the eyelids** — 8 landmark points tracing the upper and lower lid
 - **How open the eye is** — an openness scalar from fully closed to fully open
 
-It does this for both eyes simultaneously at up to **90 frames per second** on a compact embedded processor (Rockchip RK3576), with each prediction accompanied by a **confidence estimate** — the model knows when it's uncertain and says so, rather than silently publishing bad data.
+It does this for both eyes simultaneously at up to **90 frames per second** on a compact embedded processor (Rockchip RK3576), with each prediction accompanied by a **confidence estimate** — the model knows when it's uncertain and says so, rather than silently publishing bad data. It also can be streamed onto a computer VIA Wifi6, allowing for very lightweight systems.
 
 Tracking output is published over **OSC/UDP**, making it immediately compatible with social VR platforms like VRChat via [VRCFaceTracking](https://github.com/benaclejames/VRCFaceTracking).
 
