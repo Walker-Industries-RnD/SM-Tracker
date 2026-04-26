@@ -32,7 +32,7 @@ Reliable eye tracking has historically been locked behind expensive, proprietary
 
 Shinra-Meisin is like a student learning to read eyes by studying millions of synthetic examples first, then graduating to real ones.
 
-**Step 1 — Synthetic training.** Rather than needing thousands of real annotated eye images upfront, Shinra-Meisin first trains on photorealistic synthetic eyes generated with [UnityEyes](https://github.com/UnityEyes). Every pixel of every synthetic frame comes with exact ground truth labels — precise pupil position, gaze direction, eyelid shape — computed analytically from the 3D scene. No human annotation required.
+**Step 1 — Synthetic training.** Rather than needing thousands of real annotated eye images upfront, Shinra-Meisin first trains on photorealistic synthetic eyes generated with [UnityEyes2](https://github.com/alexanderdsmith/UnityEyes2). Every pixel of every synthetic frame comes with exact ground truth labels — precise pupil position, gaze direction, eyelid shape — computed analytically from the 3D scene. No human annotation required.
 
 **Step 2 — Domain adaptation.** Synthetic images and real infrared camera images look different. A separate network (SRCGAN) learns to bridge this gap, making synthetic images look like real near-infrared captures. This reduces the amount of expensive real labeled data needed to make the tracker work on actual hardware.
 
@@ -147,7 +147,7 @@ Shinra-Meisin is in active development. The current checkpoint (epoch 34) has be
 Shinra-Meisin currently trains on synthetic data generated with **UnityEyes2**. Real IR fine-tuning plans include:
 - **VRGaze** — primary source for SRCGAN domain adaptation
 
-An in-house dataset covering eye and mouth modalities across BSB2, Quest 3/3S, and Pimax Dream Air hardware is planned for public FOSS release once prototype hardware is available. Pending publication status.
+An in-house dataset covering eye and mouth modalities across BSB2, Quest 3/3S, and Pimax Dream Air hardware is planned for public FOSS release once prototype hardware is available. **NO CONSUMER DATA WILL BE COLLECTED FOR TRAINING.** Pending publication status.
 
 ---
 
