@@ -184,4 +184,8 @@ It'll be open-sourced when it's actually ready and has examples ready. Until the
 
 <img src="https://github.com/Walker-Industries-RnD/Malicious-Affiliation-Ban/blob/main/WIBan.png?raw=true" align="center" style="margin-left: 20px; margin-bottom: 20px;"/>
 
+> Read more here: https://github.com/Walker-Industries-RnD/Malicious-Affiliation-Ban/
+
+
+
 > Unauthorized use of the artwork — including but not limited to copying, distribution, modification, or inclusion in any machine-learning training dataset — is strictly prohibited and will be prosecuted to the fullest extent of the law.
