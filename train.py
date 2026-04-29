@@ -1,4 +1,7 @@
+import time
+
 from model import ShinraCNN
+from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from dataset import SyntheticDS, synth_transforms
 from early_stopping import EarlyStopping
 from torch.utils.data import DataLoader, random_split
@@ -10,19 +13,37 @@ import torch.optim as optim
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 early_stopping_patience = 5
-num_epochs = 90
+num_epochs = 60
 batch_size = 64
 loss_weights = {
-    'pupil': 1,
-    'eyelid': 1.5,
-    'gaze': 0.75
+    'diameter': 0.5,
+    'heatmaps': 500,
+    'gaze': 0.5
 }
+BORDER_PAD    = 8   # reflect-pad pixels added to each side of the model input
+HEATMAP_BORDER = 10  # heatmap pixels masked from each edge in the focal loss
 
-def heteroscedastic_loss(pred, truth, log_var):
+def focal_loss(logits, targets, gamma=2.0, alpha=0.75):
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = alpha_t * (1 - p_t) ** gamma * bce
+    # zero out the outer HEATMAP_BORDER pixels so residual edge activations don't tamper with the loss
+    m = HEATMAP_BORDER
+    mask = torch.ones_like(loss)
+    mask[..., :m, :] = 0
+    mask[..., -m:, :] = 0
+    mask[..., :, :m] = 0
+    mask[..., :, -m:] = 0
+    return (loss * mask).sum() / mask.sum()
+
+def heteroscedastic_loss(pred, truth, log_var, weight=None):
     precision = torch.exp(-log_var)
-    mse = F.mse_loss(pred, truth, reduction='none')
-    loss = precision * mse + log_var
-    return loss.mean(), mse.mean().item(), log_var.mean().item()
+    sq_err = (pred - truth) ** 2
+    if weight is not None:
+        sq_err = sq_err * weight
+    loss = (precision * sq_err + log_var).mean()
+    return loss, sq_err.mean().item(), log_var.mean().item()
 
 def find_latest_checkpoint():
     phase_dirs = sorted(
@@ -52,7 +73,8 @@ val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=16, pin_memo
 
 torch.backends.cudnn.benchmark = True
 
-shinra = ShinraCNN().to(device)
+backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+shinra = ShinraCNN(backbone, out_channels=17).to(device)
 
 # Advance thaw generator to start_phase, applying unfreezing along the way
 ckpt_path, start_phase, _ = find_latest_checkpoint()
@@ -87,33 +109,42 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
     stopper.reset()
     for epoch in range(start_epoch, num_epochs):
         epoch_losses = {head: [] for head in loss_weights.keys()}
+        pred_time = []
 
         shinra.train()
         for batch_idx, (imgs, lbls) in enumerate(train_loader):
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
-                pupil_pred, eyelid_pred, gaze_pred = shinra(imgs.to(device, dtype=torch.float32))
+                before = time.monotonic_ns()
+                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32), border_pad=BORDER_PAD)
+                if batch_idx > 0:
+                    pred_time.append(time.monotonic_ns() - before)
 
-                pupil_loss, pupil_mse, pupil_lv = heteroscedastic_loss(pupil_pred[0], lbls['pupil'].to(device, dtype=torch.float32), pupil_pred[1])
-                eyelid_loss, eyelid_mse, eyelid_lv = heteroscedastic_loss(eyelid_pred[0], lbls['eyelid_shape'].to(device, dtype=torch.float32), eyelid_pred[1])
-                gaze_loss, gaze_mse, gaze_lv = heteroscedastic_loss(gaze_pred[0], lbls['gaze_vector'].to(device, dtype=torch.float32), gaze_pred[1])
+                diam_gt  = lbls['pupil_diameter'].to(device, dtype=torch.float32).unsqueeze(-1)
+                hm_gt    = lbls['eye_heatmaps'].to(device, dtype=torch.float32)
+                gaze_gt  = lbls['gaze_vector'].to(device, dtype=torch.float32)
 
-                total_loss = loss_weights['pupil'] * pupil_loss + loss_weights['eyelid'] * eyelid_loss + loss_weights['gaze'] * gaze_loss
+                diameter_loss, _, _ = heteroscedastic_loss(diam_val, diam_gt, diam_lv)
+                heatmap_loss        = focal_loss(hm_val, hm_gt)
+                gaze_loss,     _, _ = heteroscedastic_loss(gaze_val, gaze_gt, gaze_lv)
+
+                total_loss = (loss_weights['diameter'] * diameter_loss
+                            + loss_weights['heatmaps'] * heatmap_loss
+                            + loss_weights['gaze']     * gaze_loss)
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_losses['pupil'].append(pupil_loss.item())
-            epoch_losses['eyelid'].append(eyelid_loss.item())
-            epoch_losses['gaze'].append(gaze_loss.item())
+            epoch_losses['diameter'].append(diameter_loss.item() * loss_weights['diameter'])
+            epoch_losses['heatmaps'].append(heatmap_loss.item() * loss_weights['heatmaps'])
+            epoch_losses['gaze'].append(gaze_loss.item() * loss_weights['gaze'])
 
             if batch_idx % 25 == 0:
                 print(f'EPOCH {epoch}: batch {batch_idx}: '
-                    f'pupil {mean(epoch_losses["pupil"]):.4f} '
-                    f'eyelid {mean(epoch_losses["eyelid"]):.4f} '
+                    f'diameter {mean(epoch_losses["diameter"]):.4f} '
+                    f'heatmaps {mean(epoch_losses["heatmaps"]):.4f} '
                     f'gaze {mean(epoch_losses["gaze"]):.4f} '
-                    f'| gaze mse {gaze_mse:.4f} lv {gaze_lv:.4f} '
-                    f'[{100 * (batch_idx / (len(train_set) / batch_size)):.2f}%]')
+                    f'| inference time {mean(pred_time)*1.e-6:.3f}')
 
         print(f'Epoch {epoch} finished. Validating...')
 
@@ -121,13 +152,19 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
         shinra.eval()
         with torch.no_grad():
             for imgs, lbls in val_loader:
-                pupil_pred, eyelid_pred, gaze_pred = shinra(imgs.to(device, dtype=torch.float32))
+                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32), border_pad=BORDER_PAD)
 
-                pupil_loss, _, _ = heteroscedastic_loss(pupil_pred[0], lbls['pupil'].to(device, dtype=torch.float32), pupil_pred[1])
-                eyelid_loss, _, _ = heteroscedastic_loss(eyelid_pred[0], lbls['eyelid_shape'].to(device, dtype=torch.float32), eyelid_pred[1])
-                gaze_loss, _, _ = heteroscedastic_loss(gaze_pred[0], lbls['gaze_vector'].to(device, dtype=torch.float32), gaze_pred[1])
+                diam_gt  = lbls['pupil_diameter'].to(device, dtype=torch.float32).unsqueeze(-1)
+                hm_gt    = lbls['eye_heatmaps'].to(device, dtype=torch.float32)
+                gaze_gt  = lbls['gaze_vector'].to(device, dtype=torch.float32)
 
-                val_loss = loss_weights['pupil'] * pupil_loss + loss_weights['eyelid'] * eyelid_loss + loss_weights['gaze'] * gaze_loss
+                diameter_loss, _, _ = heteroscedastic_loss(diam_val, diam_gt, diam_lv)
+                heatmap_loss        = focal_loss(hm_val, hm_gt)
+                gaze_loss,     _, _ = heteroscedastic_loss(gaze_val, gaze_gt, gaze_lv)
+
+                val_loss = (loss_weights['diameter'] * diameter_loss
+                          + loss_weights['heatmaps'] * heatmap_loss
+                          + loss_weights['gaze']     * gaze_loss)
                 val_losses.append(val_loss.item())
 
         avg_val_loss = mean(val_losses)

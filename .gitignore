@@ -219,7 +219,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-phase_*/
-run_*/
+#phase_*/
+phase_0/
+phase_1/
+phase_2/
+phase_3/
+phase_4/
 *.docx
 *.md
+./*.pth
+./*.txt
