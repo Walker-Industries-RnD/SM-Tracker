@@ -15,45 +15,37 @@ import torch.optim as optim
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 early_stopping_patience = 5
-num_epochs = 80
+num_epochs = 10
 batch_size = 64
 loss_weights = {
-    'diameter': .85,
-    'heatmaps': 700,
-    'contour': 2,
-    'gaze': .85
+    'diameter': 1,
+    'heatmaps': 3,
+    'contour': 3,
+    'suppression': 0.5,
+    'gaze': 1
 }
 
-def focal_loss(logits, targets, gamma=2, alpha=0.9):
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    p_t = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
-    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-    loss = alpha_t * (1 - p_t) ** gamma * bce
-
-    # zero out the outer HEATMAP_BORDER pixels so residual edge activations don't tamper with the loss
+def zero_mask_loss(t):
     m = HEATMAP_BORDER
-    mask = torch.ones_like(loss)
+    mask = torch.ones_like(t)
     mask[..., :m, :] = 0
     mask[..., -m:, :] = 0
     mask[..., :, :m] = 0
     mask[..., :, -m:] = 0
+    return t * mask
 
-    focal = (loss * mask).sum() / mask.sum()
-
-    # half-max contour MSE
-    pred_peak   = logits.amax(dim=(-2, -1), keepdim=True)   # (B, C, 1, 1)
+def contour_loss(sig_pred, targets):
+    # half-max contour MSE. in accordance with regular sigmoid heatmap MSE, just as a regularizer so that peak geometry is a factor too
+    pred_peak = sig_pred.amax(dim=(-2, -1), keepdim=True)
     gt_peak     = targets.amax(dim=(-2, -1), keepdim=True)
 
-    pred_region = F.relu(logits - pred_peak * 0.75)
+    pred_region = F.relu(sig_pred - pred_peak * 0.75)
     gt_region   = F.relu(targets  - gt_peak   * 0.75)
 
-    active      = (pred_peak > 0.1)          # (B, C, 1, 1) bool, broadcasts over H×W
-    pred_region = pred_region * active
-    gt_region   = gt_region   * active
+    active = pred_peak > 0.7
+    contour_loss = F.mse_loss(pred_region * active, gt_region * active)
 
-    contour_loss = F.mse_loss(pred_region, gt_region)
-
-    return focal + loss_weights['contour'] * contour_loss
+    return contour_loss
 
 def heteroscedastic_loss(pred, truth, log_var, weight=None):
     precision = torch.exp(-log_var)
@@ -126,7 +118,7 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
     optimizer = optim.Adam(optim_groups, lr=1e-3)
 
     stopper.reset()
-    for epoch in range(start_epoch, start_epoch + num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         epoch_losses = {head: [] for head in loss_weights.keys()}
         pred_time = []
 
@@ -134,9 +126,8 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
         for batch_idx, (imgs, lbls) in enumerate(train_loader):
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
-                time.sleep(0.2)
                 before = time.monotonic_ns()
-                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
+                (diam_val, diam_lv), (hm_val, hm_lv), (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
                 if batch_idx > 0:
                     pred_time.append(time.monotonic_ns() - before)
 
@@ -144,9 +135,20 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
                 hm_gt    = lbls['eye_heatmaps'].to(device, dtype=torch.float32)
                 gaze_gt  = lbls['gaze_vector'].to(device, dtype=torch.float32)
 
+                hm_val_sig = zero_mask_loss(F.sigmoid(hm_val))
+                hm_gt_sig  = zero_mask_loss(F.sigmoid(hm_gt))
+                hm_lv      = zero_mask_loss(hm_lv)
+
                 diameter_loss, _, _ = heteroscedastic_loss(diam_val, diam_gt, diam_lv)
-                heatmap_loss        = focal_loss(hm_val, hm_gt)
+                heatmap_loss,  _, _ = heteroscedastic_loss(hm_val_sig, hm_gt_sig, hm_lv)
                 gaze_loss,     _, _ = heteroscedastic_loss(gaze_val, gaze_gt, gaze_lv)
+
+                heatmap_loss += (loss_weights['contour'] * contour_loss(hm_val_sig, hm_gt_sig))
+
+                border = 1 - (zero_mask_loss(torch.ones_like(hm_val_sig)) / 1)  # 1 where border, 0 where content
+                suppression_loss = (F.sigmoid(hm_val) * border).mean()
+
+                heatmap_loss += (loss_weights['suppression'] * suppression_loss)
 
                 total_loss = (loss_weights['diameter'] * diameter_loss
                             + loss_weights['heatmaps'] * heatmap_loss
@@ -172,16 +174,26 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
         shinra.eval()
         with torch.no_grad():
             for imgs, lbls in val_loader:
-                time.sleep(0.2)
-                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
+                (diam_val, diam_lv), (hm_val, hm_lv), (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
 
                 diam_gt  = lbls['pupil_diameter'].to(device, dtype=torch.float32).unsqueeze(-1)
                 hm_gt    = lbls['eye_heatmaps'].to(device, dtype=torch.float32)
                 gaze_gt  = lbls['gaze_vector'].to(device, dtype=torch.float32)
 
+                hm_val_sig = zero_mask_loss(F.sigmoid(hm_val))
+                hm_gt_sig  = zero_mask_loss(F.sigmoid(hm_gt))
+                hm_lv      = zero_mask_loss(hm_lv)
+
                 diameter_loss, _, _ = heteroscedastic_loss(diam_val, diam_gt, diam_lv)
-                heatmap_loss        = focal_loss(hm_val, hm_gt)
+                heatmap_loss,  _, _ = heteroscedastic_loss(hm_val_sig, hm_gt_sig, hm_lv)
                 gaze_loss,     _, _ = heteroscedastic_loss(gaze_val, gaze_gt, gaze_lv)
+
+                heatmap_loss += (loss_weights['contour'] * contour_loss(hm_val_sig, hm_gt_sig))
+                
+                border = 1 - (zero_mask_loss(torch.ones_like(hm_val_sig)) / 1)  # 1 where border, 0 where content
+                suppression_loss = (F.sigmoid(hm_val) * border).mean()
+
+                heatmap_loss += (loss_weights['suppression'] * suppression_loss)
 
                 val_loss = (loss_weights['diameter'] * diameter_loss
                           + loss_weights['heatmaps'] * heatmap_loss

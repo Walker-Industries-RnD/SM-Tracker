@@ -8,26 +8,8 @@ import torch
 # eye heatmaps
 # pupil diameter (scalar)
 
-LR_MAX = 1e-4 # maximum LR for the segments
-LR_MIN = 1e-5 # minimum LR
+HEATMAP_BORDER = 4 # pixels masked from each side, both heatmap loss (0.25x) and upsample results
 
-HEATMAP_BORDER = 8 # pixels masked from each side, both heatmap loss (0.25x) and upsample results
-
-class RegressionHead(nn.Module):
-    def __init__(self, in_features, out_dim, dropout=0.3, normalize=False):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features, 128)
-        self.drop = nn.Dropout(dropout)
-        self.pred = nn.Linear(128, out_dim)
-        self.log_var = nn.Linear(128, 1)
-        self.normalize = normalize
-    def forward(self, x):
-        activations = self.drop(F.relu(self.fc1(x)))
-        pred = self.pred(activations)
-        if self.normalize:
-            pred = F.normalize(pred, dim=-1)
-        return pred, self.log_var(activations)
-    
 class DepthwiseSepConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -43,13 +25,43 @@ class DepthwiseSepConv(nn.Module):
         )
     def forward(self, x):
         return self.pw(self.dw(x))
+
+class SpatialHead(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
+        self.log_var = DepthwiseSepConv(in_channels=out_channels, out_channels=out_channels)
+    def forward(self, x):
+        heatmaps = self.conv(x)
+        return heatmaps, self.log_var(heatmaps)
+
+class RegressionHead(nn.Module):
+    def __init__(self, in_features, out_dim, dropout=0.3, normalize=False, hidden_sizes=(64,128), pool=True):
+        super().__init__()
+        self.conv = nn.Conv2d(in_features, hidden_sizes[0], kernel_size=1, padding=1, bias=False, padding_mode='zeros')
+        self.fc1 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.drop = nn.Dropout(dropout)
+        self.pred = nn.Linear(hidden_sizes[1], out_dim)
+        self.log_var = nn.Linear(hidden_sizes[1], 1)
+        self.normalize = normalize
+        self.pool = pool
+    def forward(self, x):
+        # each regression head starts with a 1x1 convolution to insulate the backbone from heads that potentially compete for loss structure, like diameter and heatmaps
+        x = self.conv(x)
+        if self.pool:
+            x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+        activations = self.drop(F.relu(self.fc1(x)))
+        pred = self.pred(activations)
+        if self.normalize:
+            pred = F.normalize(pred, dim=-1)
+        return pred, self.log_var(activations)
     
 class DecodeBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.decode_conv = DepthwiseSepConv(in_channels, out_channels)
     def forward(self, x, skip):
-        b = max(1, round(HEATMAP_BORDER * 0.25))  # scaled-down border mask before upsample (full HEATMAP_BORDER is too steep at deep resolutions)
+        b = max(1, HEATMAP_BORDER//2)  # scaled-down border mask before upsample (full HEATMAP_BORDER is too steep at deep resolutions)
         x = x.clone()
         x[..., :b, :] = 0;  x[..., -b:, :] = 0
         x[..., :, :b] = 0;  x[..., :, -b:] = 0
@@ -110,13 +122,12 @@ class ShinraCNN(nn.Module):
             self.blocks.append(DecodeBlock(o1 + o2, o2))
         self.blocks = nn.ModuleList(self.blocks)
 
-        self.heatmap_head = nn.Conv2d(in_channels=self.strided[-1], out_channels=out_channels, kernel_size=1)
+        self.heatmap_head = SpatialHead(in_channels=self.strided[-1], out_channels=out_channels)
         
-        self.diameter_pool = nn.ModuleList([nn.AdaptiveAvgPool2d((2,2)), nn.AdaptiveAvgPool2d(1)])
-        self.diameter_head = RegressionHead(in_features=80, out_dim=1, normalize=False)
-        
-        self.gaze_head = RegressionHead(in_features=96, out_dim=3, normalize=True)
-        self.gaze_pool = nn.AdaptiveAvgPool2d(1)
+        self.diameter_head = RegressionHead(in_features=96, out_dim=1, normalize=False)
+
+        self.gaze_head = RegressionHead(in_features=96, out_dim=3, normalize=True, hidden_sizes=(96, 128))
+
         self.heatmap_hw = heatmap_hw
         H, W = heatmap_hw
         ys = torch.linspace(0, 1, H)
@@ -134,7 +145,7 @@ class ShinraCNN(nn.Module):
             else:
                 bottleneck = x = segment(x)
 
-        gaze = self.gaze_head(self.gaze_pool(bottleneck).flatten(1))
+        gaze = self.gaze_head(bottleneck)
         skips = skips[::-1] # reverse order of skips, deep -> shallow now.
         decoder_feats = []  # [decoder-debug]
         for i, block in enumerate(self.blocks):
@@ -142,12 +153,14 @@ class ShinraCNN(nn.Module):
             if return_decoder_feats:  # [decoder-debug]
                 decoder_feats.append(x.detach().cpu())
         
-        logits = self.heatmap_head(x)
+        logits, hm_lvar = self.heatmap_head(x)
+
         H_tgt, W_tgt = self.heatmap_hw
         ph = (logits.shape[-2] - H_tgt) // 2
         pw = (logits.shape[-1] - W_tgt) // 2
         if ph > 0 or pw > 0:
             logits = logits[:, :, ph:ph + H_tgt, pw:pw + W_tgt]
+            hm_lvar = hm_lvar[:, :, ph:ph + H_tgt, pw:pw + W_tgt]
         if decode:
             B, C, H, W = logits.shape
             weights = torch.softmax(logits.view(B, C, -1), dim=-1).view(B, C, H, W)
@@ -157,22 +170,23 @@ class ShinraCNN(nn.Module):
         else:
             heatmaps = logits
 
-        dia_spp = [dia_pool(x).flatten(1) for dia_pool in self.diameter_pool] # 112x112x16 -> 2x2x16 + 1x1x16 -> flattened to [80]
-        d_feat = torch.cat(dia_spp, dim=1)
-
-        diameter = self.diameter_head(d_feat)
+        diameter = self.diameter_head(bottleneck)
 
         if return_decoder_feats:  # [decoder-debug]
-            return diameter, heatmaps, gaze, decoder_feats
-        return diameter, heatmaps, gaze
+            return diameter, (heatmaps, hm_lvar), gaze, decoder_feats
+        return diameter, (heatmaps, hm_lvar), gaze
     def thaw(self):
     
-        head_lr_map = torch.linspace(5e-4, 2e-4, len(self.segments))
-        segment_lr_map = torch.linspace(2e-4, 4e-5, len(self.segments))
+        head_lr_map = torch.linspace(5e-4, 1e-4, len(self.segments))
+        segment_lr_map = torch.linspace(2e-4, 2e-5, len(self.segments))
 
         head_params = (list(self.heatmap_head.parameters()) +
                        list(self.diameter_head.parameters()) +
                        list(self.gaze_head.parameters()))
+        
+        decoder_params = []
+        for block in self.blocks:
+            decoder_params.extend(block.parameters())
         
         yield None, [{'params': head_params, 'lr': 1e-3}]
 
@@ -183,9 +197,12 @@ class ShinraCNN(nn.Module):
                 if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
                     module.train()
 
-            optim_groups = [{'params': head_params, 'lr': head_lr_map[i]}]
+            optim_groups = [
+                {'params': head_params, 'lr': head_lr_map[i]},
+                {'params': decoder_params, 'lr': head_lr_map[i]}
+            ]
             
-            for j, seg in enumerate(self.segments[:i+1]):
+            for j, seg in enumerate(self.segments[::-1][:i+1]):
                 optim_groups.append({'params': seg.parameters(), 'lr': segment_lr_map[j]})
 
             yield phase, optim_groups

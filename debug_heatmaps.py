@@ -30,7 +30,9 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 from model import ShinraCNN
 from dataset import SyntheticDS
-from visualize import find_latest_checkpoint, decode_heatmaps, synth_inference_transforms, MAX_IRIS_DIAMETER
+from visualize import find_latest_checkpoint, decode_heatmaps, hard_argmax_2d, MAX_IRIS_DIAMETER, DISP_SIZE
+from dataset import BORDER_PAD
+from synthetic import RANDOM_CROP
 
 device = torch.device('cpu')
 
@@ -42,7 +44,7 @@ CHANNEL_NAMES = (
 
 PRED_COLOR = 'cyan'
 GT_COLOR   = 'lime'
-DISP       = 224   # display size for overlay panels
+DISP       = DISP_SIZE   # display size for overlay panels (RANDOM_CROP + 2*BORDER_PAD = 240)
 
 
 # ── model ──────────────────────────────────────────────────────────────────────
@@ -61,9 +63,10 @@ def load_model():
 
 
 def run_inference(shinra, raw_img):
-    x = synth_inference_transforms(raw_img).unsqueeze(0).to(device)
+    # raw_img is already canonically preprocessed (DISP_SIZE×DISP_SIZE float32)
+    x = raw_img.unsqueeze(0).to(device)
     with torch.no_grad():
-        (diam_pred, _), hm, _, dec_feats = shinra(x, return_decoder_feats=True)
+        (diam_pred, _), (hm, _), _, dec_feats = shinra(x, return_decoder_feats=True)
     diameter = diam_pred[0].squeeze().item()
     decoder_feats = [f[0].numpy() for f in dec_feats]  # list of (C, H, W)
     return torch.sigmoid(hm[0]).cpu().numpy(), diameter, decoder_feats  # (17, H, W), scalar, feats
@@ -271,19 +274,21 @@ def build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred, dia
 
     h, w = img_np.shape[:2]
 
+    # lm_* are already in DISP_SIZE display space; scale to the actual image dims in case
+    # img_np differs (e.g. future non-square displays), otherwise the factor is 1.
     gt_center = gt_diam_px = pred_center = pred_diam_px = None
     if lm_gt is not None:
-        gx = lm_gt[0, 0] * w / 640
-        gy = lm_gt[0, 1] * h / 480
+        gx = lm_gt[0, 0] * w / DISP_SIZE
+        gy = lm_gt[0, 1] * h / DISP_SIZE
         gt_center = (gx, gy)
         if diam_gt is not None:
-            gt_diam_px = diam_gt * MAX_IRIS_DIAMETER * w / 640
+            gt_diam_px = diam_gt * MAX_IRIS_DIAMETER * w / DISP_SIZE
     if have_pred and lm_pred is not None:
-        px = lm_pred[0, 0] * w / 640
-        py = lm_pred[0, 1] * h / 480
+        px = lm_pred[0, 0] * w / DISP_SIZE
+        py = lm_pred[0, 1] * h / DISP_SIZE
         pred_center = (px, py)
         if diam_pred is not None:
-            pred_diam_px = diam_pred * MAX_IRIS_DIAMETER * w / 640
+            pred_diam_px = diam_pred * MAX_IRIS_DIAMETER * w / DISP_SIZE
 
     panels.append({
         'title': 'Source image',
@@ -495,13 +500,17 @@ def plot_sample(shinra, ds, idx):
         img_np = img_np[..., 0]
 
     hm_gt  = gt['eye_heatmaps'].numpy()
-    lm_gt  = decode_heatmaps(gt['eye_heatmaps'], out_w=640, out_h=480).numpy()
+    lm_gt  = decode_heatmaps(gt['eye_heatmaps'],
+                              out_w=RANDOM_CROP, out_h=RANDOM_CROP,
+                              border_pad=BORDER_PAD).numpy()
 
     have_pred = shinra is not None
     dec_feats = None
     if have_pred:
         hm_pred, diam_pred, dec_feats = run_inference(shinra, raw_img)
-        lm_pred = decode_heatmaps(torch.from_numpy(hm_pred), out_w=640, out_h=480).numpy()
+        lm_pred = decode_heatmaps(torch.from_numpy(hm_pred),
+                                  out_w=RANDOM_CROP, out_h=RANDOM_CROP,
+                                  border_pad=BORDER_PAD).numpy()
     else:
         hm_pred = lm_pred = diam_pred = None
 

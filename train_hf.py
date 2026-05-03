@@ -24,8 +24,8 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from huggingface_hub import snapshot_download
 
 from model import ShinraCNN, HEATMAP_BORDER
-from synthetic import _to_hm, render_gaussian, derive_pupil_stats, INPUT_H, INPUT_W
-from dataset import SyntheticTransform
+from synthetic import _to_hm, render_gaussian, derive_pupil_stats, INPUT_H, INPUT_W, EVAL_CROP_XY, CROP_SIZE, RANDOM_CROP
+from dataset import SyntheticTransform, to_gray_tensor, BORDER_PAD
 from early_stopping import EarlyStopping
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -33,9 +33,9 @@ HF_REPO      = 'jpena-173/sm-eyes-v1'
 DATA_DIR     = './sm-eyes-v1'
 BATCH_SIZE   = 128
 NUM_WORKERS  = 8
-NUM_EPOCHS   = 80
+NUM_EPOCHS   = 10
 ES_PATIENCE  = 5
-LOSS_WEIGHTS = {'diameter': .85, 'heatmaps': 700, 'contour': 2, 'gaze': .85}
+LOSS_WEIGHTS = {'diameter': 1, 'heatmaps': 3, 'contour': 3, 'gaze': 1}
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -54,7 +54,7 @@ def get_parquet_files():
 
 
 # ── Label conversion ──────────────────────────────────────────────────────────
-def convert_parquet(row, crop_xy=(0, 0), flipped=False, resize=(224, 224)):
+def convert_parquet(row, crop_xy=EVAL_CROP_XY, flipped=False):
     """Build GT tensors from a Parquet row. Mirrors synthetic.convert() for JSON."""
     gt = {}
     gx, gy, gz, _ = row['look_vec']
@@ -62,9 +62,8 @@ def convert_parquet(row, crop_xy=(0, 0), flipped=False, resize=(224, 224)):
 
     pupil_x, pupil_y, gt['pupil_diameter'] = derive_pupil_stats(row['iris_2d'], row['pupil_size'])
 
-    eye_heatmaps = []
-    hm_x, hm_y = _to_hm(pupil_x, pupil_y, crop_xy, flipped, resize)
-    eye_heatmaps.append(render_gaussian(INPUT_H, INPUT_W, hm_x, hm_y, 1.5))
+    eye_heatmaps = [render_gaussian(INPUT_H, INPUT_W,
+                                    *_to_hm(pupil_x, pupil_y, crop_xy, flipped), 1.5)]
 
     upper = list(row['upper_eyelid_2d'])
     lower = list(row['lower_eyelid_2d'])
@@ -74,8 +73,8 @@ def convert_parquet(row, crop_xy=(0, 0), flipped=False, resize=(224, 224)):
 
     for pts in (upper, lower):
         for pt in pts:
-            hm_x, hm_y = _to_hm(pt[0], pt[1], crop_xy, flipped, resize)
-            eye_heatmaps.append(render_gaussian(INPUT_H, INPUT_W, hm_x, hm_y, 2))
+            eye_heatmaps.append(render_gaussian(INPUT_H, INPUT_W,
+                                                *_to_hm(pt[0], pt[1], crop_xy, flipped), 2))
 
     gt['eye_heatmaps'] = torch.stack(eye_heatmaps)  # (17, 112, 112)
     return gt
@@ -96,23 +95,26 @@ class ParquetEyeDS(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        from torchvision.transforms.v2 import functional as TF
+        row    = self.df.iloc[idx]
         img_np = np.frombuffer(row['image']['bytes'], dtype=np.uint8).copy()
         img    = decode_image(torch.from_numpy(img_np))  # (C, H, W) uint8
 
-        crop_xy = (0, 0)
-        flipped = False
-        resize  = (224, 224)
-
         if self.transforms is not None:
             img, crop_xy, flipped = self.transforms(img)
-            resize = (256, 256)
+        else:
+            img = TF.center_crop(img, [CROP_SIZE, CROP_SIZE])
+            img = TF.center_crop(img, [RANDOM_CROP, RANDOM_CROP])
+            img = to_gray_tensor(img)
+            img = TF.pad(img, BORDER_PAD)
+            crop_xy = EVAL_CROP_XY
+            flipped = False
 
-        return img, convert_parquet(row, crop_xy=crop_xy, flipped=flipped, resize=resize)
+        return img, convert_parquet(row, crop_xy=crop_xy, flipped=flipped)
 
 
 # ── Losses ────────────────────────────────────────────────────────────────────
-def focal_loss(logits, targets, gamma=2, alpha=0.9):
+def focal_loss(logits, targets, gamma=2, alpha=0.75):
     bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
     p_t    = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
     alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
@@ -126,8 +128,8 @@ def focal_loss(logits, targets, gamma=2, alpha=0.9):
 
     pred_peak   = logits.amax(dim=(-2, -1), keepdim=True)
     gt_peak     = targets.amax(dim=(-2, -1), keepdim=True)
-    pred_region = F.relu(logits   - pred_peak * 0.75)
-    gt_region   = F.relu(targets  - gt_peak   * 0.75)
+    pred_region = F.relu(logits   - pred_peak * 0.5)
+    gt_region   = F.relu(targets  - gt_peak   * 0.5)
     active      = pred_peak > 0.1
     contour_loss = F.mse_loss(pred_region * active, gt_region * active)
 
